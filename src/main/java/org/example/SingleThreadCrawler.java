@@ -1,6 +1,9 @@
 package org.example;
 
-import lombok.AllArgsConstructor;
+
+import org.example.queue.CustomQueue;
+import org.example.queue.Queue;
+import org.example.set.CoarseHashSet;
 
 import java.util.*;
 import java.util.concurrent.TimeUnit;
@@ -10,50 +13,60 @@ import static java.lang.String.join;
 
 
 public class SingleThreadCrawler {
+    private final Queue<Node> searchQueue = new CustomQueue<>();
+    private final org.example.set.HashSet<String> visited = new CoarseHashSet<>(1000);
+    private final WikiClient client = new WikiClient();
 
     public static void main(String[] args) throws Exception {
         SingleThreadCrawler crawler = new SingleThreadCrawler();
 
         long startTime = System.nanoTime();
-        String result = crawler.find("Java_(programming_language)", "Cat", 5, TimeUnit.MINUTES);
+        // Лимит для потоков определил методом "тыка", чтобы не попасть под rate limiter википедии (примерно не более 200 запросов в секунду)
+        String result = crawler.find("Java_(programming_language)", "Cat", 3, TimeUnit.MINUTES, 200, 2);
         long finishTime = TimeUnit.SECONDS.convert(System.nanoTime() - startTime, TimeUnit.NANOSECONDS);
 
-        System.out.println("Took "+finishTime+" seconds, result is: " + result);
+        System.out.println("Took " + finishTime + " seconds, result is: " + result);
     }
 
-    private Queue<Node> searchQueue = new LinkedList<>();
-
-    private Set<String> visited = new HashSet<>();
-
-    private WikiClient client = new WikiClient();
-
-    public String find(String from, String target, long timeout, TimeUnit timeUnit) throws Exception {
+    public String find(String from, String target, long timeout, TimeUnit timeUnit, int threadLimit, int searchLevels) throws Exception {
         long deadline = System.nanoTime() + timeUnit.toNanos(timeout);
-        searchQueue.offer(new Node(from, null));
+        searchQueue.add(new Node(from, null, from, from));
         Node result = null;
-        while (result == null && !searchQueue.isEmpty()) {
+        var level = -1;
+
+        while (result == null && !searchQueue.isEmpty() && level <= searchLevels) {
+            level++;
+            System.out.println("Search level: " + level);
             if (deadline < System.nanoTime()) {
                 throw new TimeoutException();
             }
-            Node node = searchQueue.poll();
-            System.out.println("Get page: " + node.title);
-            Set<String> links = client.getByTitle(node.title);
-            if (links.isEmpty()) {
-                //pageNotFound
-                continue;
+
+            Set<Crawler> threads = new HashSet<>();
+            Set<Crawler> joinedThreads = new HashSet<>();
+            while (!searchQueue.isEmpty() && result == null) {
+                if (deadline < System.nanoTime()) {
+                    throw new TimeoutException();
+                }
+                var node = searchQueue.poll();
+                var crawler = new Crawler(node, visited, client);
+                crawler.start();
+                threads.add(crawler);
+                if (threads.size() > threadLimit) {
+                    result = getResultFromThreads(threads, target);
+                    joinedThreads.addAll(threads);
+                    threads.clear();
+                    Thread.sleep(1500L);
+                }
             }
-            for (String link : links) {
-                String currentLink = link.toLowerCase();
-                if (visited.contains(currentLink)) {
-                    continue;
+
+            if (result == null) {
+                result = getResultFromThreads(threads, target);
+            }
+            if (result == null) {
+                joinedThreads.addAll(threads);
+                for (var thread : joinedThreads) {
+                    thread.getResultNodes().forEach(searchQueue::add);
                 }
-                visited.add(currentLink);
-                Node subNode = new Node(link, node);
-                if (target.equalsIgnoreCase(currentLink)) {
-                    result = subNode;
-                    continue;
-                }
-                searchQueue.offer(subNode);
             }
         }
 
@@ -61,11 +74,11 @@ public class SingleThreadCrawler {
             List<String> resultList = new ArrayList<>();
             Node search = result;
             while (true) {
-                resultList.add(search.title);
-                if (search.next == null) {
+                resultList.add(search.getLink());
+                if (search.getNext() == null) {
                     break;
                 }
-                search = search.next;
+                search = search.getNext();
             }
             Collections.reverse(resultList);
 
@@ -75,9 +88,25 @@ public class SingleThreadCrawler {
         return "not found";
     }
 
-    @AllArgsConstructor
-    private static class Node {
-        String title;
-        Node next;
+    private Node getResultFromThreads(Set<Crawler> threads, String target) throws InterruptedException {
+        Node result = null;
+        Set<Crawler> joinedThreads = new HashSet<>();
+        while (threads.size() != joinedThreads.size()) {
+            for (var thread : threads) {
+                if (!joinedThreads.contains(thread) && !thread.isAlive()) {
+                    thread.join();
+                    joinedThreads.add(thread);
+                    if (result == null) {
+                        var nodes = thread.getResultNodes();
+                        for (var node : nodes) {
+                            if (node.getLink().equalsIgnoreCase(target) || node.getTitle().equalsIgnoreCase(target) || node.getText().equalsIgnoreCase(target)) {
+                                result = node;
+                            }
+                        }
+                    }
+                }
+            }
+        }
+        return result;
     }
 }
